@@ -1,0 +1,85 @@
+#!/usr/bin/env bpftrace
+/*
+ * 지표 2(프레임당 커널 복사 시간) + 지표 3(복사 함수 호출 수) 동시 측정 — 송신(RPi5) 측.
+ *
+ * TCP 송신 경로에서 유저 버퍼 → 커널(skb) 복사는 다음과 같이 들어간다 (Linux 6.8 기준).
+ *   tcp_sendmsg_locked → skb_copy_to_page_nocache → skb_do_copy_data_nocache
+ *     → copy_from_iter_full()          → _copy_from_iter          (기본)
+ *     → copy_from_iter_full_nocache()  → _copy_from_iter_nocache  (NETIF_F_NOCACHE_COPY 켜진 NIC)
+ *     → csum_and_copy_from_iter_full()                            (TX 체크섬 오프로드가 없을 때)
+ * inline 래퍼는 프로브할 수 없으므로 실제 심볼 _copy_from_iter / _copy_from_iter_nocache 에 건다.
+ * (이전 버전의 skb_copy_datagram_from_iter 는 UDP/unix 경로, copy_page_from_iter 는 pipe/read 경로라
+ *  TCP 송신 복사를 잡지 못했고, __copy_from_user 는 arm64에서 inline이라 프로브할 수 없었다.)
+ *
+ * ★ 사전 확인 (RPi5에서 반드시 먼저 — 커널 심볼은 아키텍처·버전마다 다르다):
+ *     sudo bpftrace -l 'kprobe:_copy_from_iter*'
+ *       → _copy_from_iter, _copy_from_iter_nocache 둘 다 보여야 한다.
+ *     ethtool -k eth0 | grep tx-checksumming
+ *       → off 이면 csum_and_copy_from_iter_full 도 아래 두 프로브 목록에 추가해야 한다.
+ *   확인 방법: copy 패스 1회 실행 시 G1(copy)의 copy_calls 가 G2(msg_zc)보다 훨씬 커야 한다.
+ *
+ * 측정 범위
+ *   - comm == "zc-bench" 인 스레드만 집계 (sshd 등 다른 프로세스의 복사 제외)
+ *   - 중첩 호출은 가장 바깥 호출만 1건으로 센다 (@depth)
+ *   - 워밍업을 포함한 zc-bench 실행 전체가 대상 → merge_copy.py는 frames_total / run_ns 로 나눈다
+ *
+ * 사용
+ *   run_matrix.sh 의 copy 패스가 자동 실행한다 (sudo timeout --signal=INT ... 로 스스로 종료).
+ *   수동: sudo bpftrace -B line scripts/measure_copy.bt > data/raw/<tag>.copy   (Ctrl-C로 종료)
+ *
+ * 주의
+ *   프로브 오버헤드가 CPU 측정을 오염시키므로, 지표 1(%CPU per Gbps)을 재는 cpu 패스와는
+ *   반드시 분리해서 돌린다.
+ */
+
+BEGIN
+{
+    @t0 = nsecs;
+    // zero-copy가 성립해 복사가 0건이어도 END에서 0이 출력되도록 초기화
+    @copy_ns_total = sum(0);
+    @copy_calls = sum(0);
+    printf("# zc-bench copy-time probe started\n");
+}
+
+/* 송신 경로: 유저 버퍼 -> 커널 */
+kprobe:_copy_from_iter,
+kprobe:_copy_from_iter_nocache
+/comm == "zc-bench"/
+{
+    if (@depth[tid] == 0) {
+        @start[tid] = nsecs;
+    }
+    @depth[tid] += 1;
+}
+
+kretprobe:_copy_from_iter,
+kretprobe:_copy_from_iter_nocache
+/comm == "zc-bench" && @depth[tid] > 0/
+{
+    @depth[tid] -= 1;
+    if (@depth[tid] == 0) {
+        $dur = nsecs - @start[tid];
+        @copy_ns_total = sum($dur);
+        @copy_calls = sum(1);
+        @copy_ns_hist = hist($dur);
+        delete(@start[tid]);
+        delete(@depth[tid]);
+    }
+}
+
+END
+{
+    $wall = nsecs - @t0;
+    clear(@start);
+    clear(@depth);
+    printf("\n");
+    // wall_ns: bpftrace 부착 시간 (참고용 — timeout 여유분이 포함되므로 분모로 쓰지 않는다)
+    printf("wall_ns %llu\n", $wall);
+    print(@copy_ns_total);
+    print(@copy_calls);
+    print(@copy_ns_hist);
+    clear(@copy_ns_total);
+    clear(@copy_calls);
+    clear(@copy_ns_hist);
+    clear(@t0);
+}

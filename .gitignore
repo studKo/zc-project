@@ -1,0 +1,8 @@
+# Rust build output
+target/
+
+# measurement results (summary.csv, raw/, plots/)
+data/
+
+# Python bytecode
+__pycache__/
