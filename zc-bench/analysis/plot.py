@@ -7,12 +7,14 @@
 
 플랜 §6 지표 체계에 대응하는 그래프
 (모두 MTU × fps 격자, 막대 = 반복 평균, 오차 막대 = 95% 신뢰구간)
+  0.  실제 달성 fps                  — 조건 성립 확인            [pass=cpu]
   1.  %CPU per Gbps                 — 층1 지표 1 (주 지표)     [pass=cpu]
+  1b. 시스템 전체 %CPU per Gbps      — 지표 1 교차 확인(softirq 포함, mpstat 병합 후) [pass=cpu]
   2.  프레임당 커널 복사 시간 (주)   — 층1 지표 2               [pass=copy]
   2b. 커널 복사 시간 점유율 (보조)   — 층1 지표 2               [pass=copy]
   3.  복사 함수 호출 수              — 층2 지표 3               [pass=copy]
   4.  컨텍스트 스위치                — 층2 지표 4               [pass=cpu]
-  5.  G1 → G2 효과 분리 요약         — zero-copy 순수 효과      [pass=cpu]
+  5.  G1 → G2 효과 분리 요약         — zero-copy 순수 효과      [pass=cpu] (5b: 시스템 CPU 기준)
 
 지표 1·4는 cpu 패스만, 지표 2·3은 copy 패스만 쓴다 (bpftrace 오버헤드가 지표 1에 섞이지 않도록).
 
@@ -20,6 +22,10 @@
   - msg_zc 실행인데 zero-copy 성공률이 100% 미만이거나 기록이 없는(NaN) 행 — 지표 5 무효 판정
   - throttled 가 0x0 / n/a 가 아닌 행 — 실행 중 스로틀링 발생
   - null sink 행 — 프레임 생성 비용 기저값 (비교 대상 아님)
+
+경고만 하는 항목 (제외하지 않음)
+  - 달성 fps가 목표의 98% 미만인 조건 — 링크 포화·버퍼 대기로 "그 fps" 조건이 성립하지 않았음
+  - msg_zc 실행 중 완료 통보가 전송 수보다 적은 행 (zc_completed < zc_sent)
 """
 import math
 import os
@@ -66,7 +72,8 @@ def t95(n):
 df = pd.read_csv(SUMMARY, keep_default_na=False, na_values=["NaN", ""])
 
 REQUIRED = {"pass", "mtu", "fps", "case", "sink", "chunk_bytes", "zc_success_pct",
-            "throttled", "cpu_per_gbps", "ctx_vol", "ctx_invol", "tag"}
+            "throttled", "cpu_per_gbps", "ctx_vol", "ctx_invol", "tag",
+            "achieved_fps", "zc_sent", "zc_completed"}
 missing = REQUIRED - set(df.columns)
 if missing:
     sys.exit(f"{SUMMARY}에 {sorted(missing)} 컬럼이 없습니다 — 이전 스키마 파일입니다. "
@@ -97,6 +104,13 @@ if thr_na:
 if df.empty:
     sys.exit("유효한 데이터가 없습니다. 루프백이 아닌 실제 NIC 경로에서 측정하세요.")
 
+# 완료 통보 누락 — 성공률이 "받은 통보" 기준이라 누락분의 폴백 여부는 알 수 없다
+zc_missing = (df["sink"] == "msg_zc") & (df["zc_completed"] < df["zc_sent"])
+if zc_missing.any():
+    print(f"[경고] 완료 통보 누락 행 {int(zc_missing.sum())}건 (zc_completed < zc_sent) — "
+          "성공률은 수신된 통보 기준입니다:")
+    print(df.loc[zc_missing, ["pass", "tag", "zc_sent", "zc_completed"]].to_string(index=False))
+
 # 전송 단위 라벨 (0 = 프레임 전체)
 df["unit"] = df["chunk_bytes"].map(lambda b: "full" if b == 0 else f"{int(b) // 1024}K")
 df["unit_bytes"] = df["chunk_bytes"].where(df["chunk_bytes"] > 0, float("inf"))
@@ -122,7 +136,7 @@ def aggregate(sub, col):
     return a
 
 
-def grid_bar(sub, col, ylabel, title, fname):
+def grid_bar(sub, col, ylabel, title, fname, lower_better=True):
     """MTU(행) × fps(열) 격자. 각 칸 = 전송 단위별 케이스 막대 + 95% CI 오차 막대."""
     a = aggregate(sub, col)
     if a.empty:
@@ -149,17 +163,37 @@ def grid_bar(sub, col, ylabel, title, fname):
             ax.set_ylabel(ylabel)
             ax.grid(alpha=0.3, axis="y")
             ax.legend(fontsize=8)
-    fig.suptitle(f"{title}  (bar = mean, error = 95% CI, lower is better)")
+    better = "lower" if lower_better else "higher"
+    fig.suptitle(f"{title}  (bar = mean, error = 95% CI, {better} is better)")
     fig.tight_layout()
     fig.savefig(os.path.join(OUTDIR, fname), dpi=140)
     plt.close(fig)
 
+
+# ── 0. 실제 달성 fps — 목표 fps 조건이 성립했는지 (cpu 패스) ───────
+fps_ok = aggregate(cpu, "achieved_fps")
+if not fps_ok.empty:
+    short = fps_ok[fps_ok["mean"] < fps_ok["fps"] * 0.98]
+    if not short.empty:
+        print("[경고] 달성 fps가 목표의 98% 미만인 조건 — 링크 포화·버퍼 대기로 해당 fps 조건이 성립하지 않았습니다:")
+        print(short[["mtu", "fps", "case", "unit", "mean"]]
+              .rename(columns={"mean": "achieved_fps"}).to_string(index=False))
+    grid_bar(cpu, "achieved_fps", "achieved fps", "Metric 0: achieved frame rate",
+             "0_achieved_fps.png", lower_better=False)
 
 # ── 1. %CPU per Gbps (층1 지표 1) — cpu 패스 ──────────────────────
 if cpu.empty:
     print("[참고] cpu 패스 데이터가 없어 지표 1·4·5를 건너뜁니다.")
 else:
     grid_bar(cpu, "cpu_per_gbps", "%CPU per Gbps", "Metric 1: CPU efficiency", "1_cpu_per_gbps.png")
+
+# ── 1b. 시스템 전체 %CPU per Gbps (softirq·IRQ 포함, mpstat) — cpu 패스 ──
+has_sys = "sys_cpu_per_gbps" in cpu.columns and cpu["sys_cpu_per_gbps"].notna().any()
+if has_sys:
+    grid_bar(cpu, "sys_cpu_per_gbps", "system %CPU per Gbps (1 core = 100%)",
+             "Metric 1b: system-wide CPU efficiency (incl. softirq)", "1b_sys_cpu_per_gbps.png")
+elif not cpu.empty:
+    print("[참고] sys_cpu_per_gbps 값이 없어 지표 1b를 건너뜁니다 (merge_copy.py로 mpstat 병합 필요).")
 
 # ── 2. 커널 복사 시간 (층1 지표 2) — copy 패스 ────────────────────
 has_copy = "copy_us_frame" in copy.columns and copy["copy_us_frame"].notna().any()
@@ -182,8 +216,13 @@ if not cpu.empty:
     grid_bar(cpu, "ctx_total", "context switches", "Metric 4: context switches", "4_ctx_switches.png")
 
 # ── 5. G1 → G2 효과 분리 요약 — cpu 패스 ──────────────────────────
-a = aggregate(cpu, "cpu_per_gbps")
-if not a.empty and {"G1", "G2"}.issubset(set(a["case"])):
+
+
+def gain_summary(col, label, fname):
+    """G1 대비 G2 절감률 표(평균 ± 95% CI)와 선 그래프."""
+    a = aggregate(cpu, col)
+    if a.empty or not {"G1", "G2"}.issubset(set(a["case"])):
+        return
     g1 = a[a["case"] == "G1"].set_index(["mtu", "fps", "unit"])
     g2 = a[a["case"] == "G2"].set_index(["mtu", "fps", "unit"])
     common = sorted(g1.index.intersection(g2.index),
@@ -202,7 +241,7 @@ if not a.empty and {"G1", "G2"}.issubset(set(a["case"])):
             verdict = "CI 분리"
         rows.append((*key, m1, c1, n1, m2, c2, n2, red, verdict))
 
-    print("\nG1 → G2 (%CPU per Gbps, 평균 ± 95% CI)")
+    print(f"\nG1 → G2 ({label}, 평균 ± 95% CI)")
     print(f"{'MTU':>5} {'fps':>4} {'unit':>5} | {'G1':>16} {'n':>3} | {'G2':>16} {'n':>3} | {'절감률':>7} | 판정")
     for mtu, fps, unit, m1, c1, n1, m2, c2, n2, red, verdict in rows:
         print(f"{mtu:>5} {fps:>4} {unit:>5} | {m1:>8.2f} ± {c1:>5.2f} {n1:>3} | "
@@ -220,11 +259,17 @@ if not a.empty and {"G1", "G2"}.issubset(set(a["case"])):
     ax.axhline(0, color="gray", lw=0.8)
     ax.set_xlabel("send unit")
     ax.set_ylabel("CPU reduction (%)")
-    ax.set_title("G1 -> G2: zero-copy net effect (%CPU per Gbps)")
+    ax.set_title(f"G1 -> G2: zero-copy net effect ({col})")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
     fig.tight_layout()
-    fig.savefig(os.path.join(OUTDIR, "5_zerocopy_gain.png"), dpi=140)
+    fig.savefig(os.path.join(OUTDIR, fname), dpi=140)
     plt.close(fig)
+
+
+gain_summary("cpu_per_gbps", "%CPU per Gbps — 프로세스", "5_zerocopy_gain.png")
+if has_sys:
+    # 프로세스 기준(5)과 시스템 기준(5b)의 절감률이 크게 다르면, 프로세스 밖(softirq 등)으로 옮겨간 비용이 있다는 뜻
+    gain_summary("sys_cpu_per_gbps", "%CPU per Gbps — 시스템 전체", "5b_zerocopy_gain_sys.png")
 
 print(f"\n그래프 생성 완료 → {OUTDIR}/")
