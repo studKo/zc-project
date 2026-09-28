@@ -4,7 +4,9 @@
 # 플랜 §5.1 조건 축을 그대로 따른다:
 #   - 해상도 1280x960 NV12 고정 (프레임 1,843,200 B)
 #   - 청크 크기 : 64KB / 460KB / 1.84MB
-#   - fps       : 30 / 60 / 90
+#   - fps       : 기본 30 한 조건. 비교 시 환경변수 FPS로 24/30/60 중에서 선택
+#                 (24=354 / 30=442 / 60=885 Mbps — 60은 GbE MTU 1500 실효 대역폭 ~941 Mbps에 근접.
+#                  그 이상(예: 90=1,327 Mbps)은 링크 용량을 넘어 허용하지 않는다)
 #   - MTU       : 1500 / 9000  ← setup_env.sh로 양쪽 전환 후 각각 1회씩 실행
 #
 # 2패스 구조:
@@ -29,6 +31,7 @@
 #   ./scripts/run_matrix.sh [수신IP:포트] [반복횟수] [측정초] [pass]
 #   ./scripts/run_matrix.sh 192.168.50.2:5001 10 100 cpu
 #   ./scripts/run_matrix.sh 192.168.50.2:5001 3 60 copy
+#   FPS="24 30 60" ./scripts/run_matrix.sh 192.168.50.2:5001 10 100 cpu   # fps 비교
 #   송신 인터페이스는 환경변수 IFACE로 지정 (기본 eth0)
 set -euo pipefail
 
@@ -51,11 +54,12 @@ SESSION="$(date +%m%d%H%M)"   # 같은 조건을 다시 돌려도 tag가 겹치�
 # 고정 사양 (플랜 §2.1)
 WIDTH=1280
 HEIGHT=960
+FRAME_BYTES=$((WIDTH * HEIGHT * 3 / 2 + 40))   # NV12 페이로드 + 헤더 40 B
 
 # 조건 축 — 순서가 고정되도록 인덱스 배열 사용
 CHUNK_KEYS=(64K 460K full)
 CHUNK_BYTES=(65536 471040 0)
-FPS_LIST=(30 60 90)
+read -r -a FPS_LIST <<< "${FPS:-30}"   # 기본 30fps 한 조건, FPS="24 30 60" 으로 비교
 # Case G1 = appsink→일반 send 상당, G2 = appsink→MSG_ZEROCOPY 상당
 CASE_KEYS=(G1 G2)
 CASE_SINKS=(copy msg_zc)
@@ -67,6 +71,15 @@ esac
 
 for v in "$REPEAT" "$DURATION"; do
   [[ "$v" =~ ^[0-9]+$ ]] || { echo "[중단] 반복횟수·측정초는 정수여야 합니다: $v"; exit 1; }
+done
+
+# fps는 GbE 링크 용량 안의 값만 허용 — 넘는 조건은 "fps 비교"가 아니라 "링크 포화 테스트"가 된다
+[ "${#FPS_LIST[@]}" -gt 0 ] || { echo "[중단] FPS가 비어 있습니다"; exit 1; }
+for f in "${FPS_LIST[@]}"; do
+  case "$f" in
+    24|30|60) ;;
+    *) echo "[중단] 허용하지 않는 fps: $f (24/30/60 중에서 선택, 기본 30)"; exit 1 ;;
+  esac
 done
 
 # zc-bench의 --duration은 워밍업을 포함한다 → 워밍업 이하이면 측정 구간이 0
@@ -96,8 +109,8 @@ mkdir -p "$RAWDIR"
 # ── summary.csv 스키마 확인 (이전 버전 파일에는 이어 쓰지 않는다) ──
 if [ -s "$OUT" ]; then
   hdr=",$(head -n 1 "$OUT" | tr -d '\r'),"
-  if [[ "$hdr" != *,pass,* || "$hdr" != *,run_ns,* ]]; then
-    echo "[중단] $OUT 은 이전 스키마(pass/run_ns 컬럼 없음) 파일입니다."
+  if [[ "$hdr" != *,pass,* || "$hdr" != *,achieved_fps,* || "$hdr" != *,zc_sent,* ]]; then
+    echo "[중단] $OUT 은 이전 스키마(pass/achieved_fps/zc_sent 컬럼 없음) 파일입니다."
     echo "       mv $OUT $OUT.old  후 다시 실행하세요."
     exit 1
   fi
@@ -143,12 +156,16 @@ if [ "$PASS" = "copy" ]; then
 fi
 
 echo "target=$TARGET repeat=$REPEAT duration=${DURATION}s pass=$PASS mtu=$MTU session=$SESSION"
+for f in "${FPS_LIST[@]}"; do
+  echo "  fps $f → 예상 $((FRAME_BYTES * 8 * f / 1000000)) Mbps (GbE TCP 실효 ~941 Mbps @MTU1500)"
+done
 echo "※ 수신 측(NUC)에서 먼저 실행: $BIN --mode receiver --port $PORT"
 echo
 
-# 기저값: 프레임 생성 비용 (전송 없음) — CPU 지표용이므로 cpu 패스에서만
+# 기저값: 프레임 생성 비용 (전송 없음) — CPU 지표용이므로 cpu 패스에서만.
+# 매트릭스 실행과 같은 코어(2,3)에 고정해야 비교 가능하다.
 if [ "$PASS" = "cpu" ]; then
-  "$BIN" --mode sender --sink null --duration 20 --warmup 3 \
+  taskset -c 2,3 "$BIN" --mode sender --sink null --duration 20 --warmup 3 \
        --case N --tag "cpu_N_baseline_mtu${MTU}_s${SESSION}" --pass cpu --mtu "$MTU" \
        --fps 30 --width "$WIDTH" --height "$HEIGHT" \
        --out "$OUT" >/dev/null
@@ -204,7 +221,7 @@ run_one() {
        --duration "$DURATION" --warmup "$WARMUP" \
        --case "$ckase" --tag "$tag" --pass "$PASS" --mtu "$MTU" \
        --out "$OUT" --raw "$RAWDIR/${tag}.csv" > "$log" 2>&1; then
-    grep -E 'CPU per Gbps|zero-copy|dropped|throttled|경고' "$log" || true
+    grep -E 'CPU per Gbps|achieved fps|zero-copy|throttled|경고' "$log" || true
   else
     FAILED=$((FAILED + 1))
     echo "  [실패] 로그: $log"
