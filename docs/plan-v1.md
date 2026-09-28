@@ -4,6 +4,7 @@
 
 작성일: 2026-09-17
 개정: 2026-09-27 — 측정 도구 점검 반영 (지표 2 정의, 2패스 분리, 실행 순서, 스로틀 판정, 신뢰구간)
+개정: 2026-09-29 — fps 축을 링크 용량 안으로 조정(기본 30, 선택 24/30/60), 달성 fps·지연 프레임 기록, 시스템 전체 CPU(지표 1b) 추가
 
 ---
 
@@ -35,9 +36,11 @@ NUC의 Intel I219-V는 하드웨어 타임스탬프를 지원하여, RPi5 단독
 해상도  : 1280 × 960
 포맷    : NV12 (YUV420, 12bpp)
 프레임  : 1,843,200 B ≈ 1.84 MB
-fps     : 30 (기본), 60 / 90 (부하 스윕)
-대역폭  : 442 Mbps (1GbE 대비 약 44% — 링크 포화 없음)
+fps     : 30 (기본). 비교 시 24 / 30 / 60 중에서 선택
+대역폭  : 24fps = 354 Mbps, 30fps = 442 Mbps (1GbE 대비 약 44% — 링크 포화 없음), 60fps = 885 Mbps
 ```
+
+GbE의 TCP 실효 대역폭은 약 941 Mbps(MTU 1500) / 990 Mbps(MTU 9000)다. 60fps는 MTU 1500에서 94%로 포화 직전이므로 `achieved_fps`로 목표 fps를 실제로 냈는지 확인한다. 90fps(1,327 Mbps)는 링크 용량을 넘어 "fps 비교"가 아니라 "링크 포화 테스트"가 되므로 쓰지 않는다(`run_matrix.sh`가 거부).
 
 ---
 
@@ -112,12 +115,14 @@ G1 → G2 : zero-copy 순수 효과  ← 증명하고자 하는 값
 | 축 | 값 |
 |---|---|
 | MTU | 1500 / 9000 |
-| fps | 30 / 60 / 90 |
+| fps | 기본 30. 비교 시 24 / 30 / 60 (`FPS="24 30 60" ./scripts/run_matrix.sh ...`) |
 | 청크 크기 | 64KB / 460KB / 1.84MB |
 
 각 조합 10회 반복 × 100초, 워밍업 5초 제외(데이터와 CPU 시간 모두). CPU governor는 양쪽 모두 `performance`로 고정한다.
 
 반복은 조건마다 G1/G2를 **번갈아** 실행한다(홀수 회차 G1→G2, 짝수 회차 G2→G1). G1 10회를 다 돌고 G2 10회를 도는 순서면 RPi5 온도 상승(열 드리프트)이 G1/G2 차이에 섞이기 때문이다. 결과 그래프는 반복 평균과 95% 신뢰구간(t분포)을 함께 표시해, G1/G2 차이가 실행 간 편차보다 큰지 판단한다.
+
+송신 루프는 한 주기(1/fps) 안에 전송을 끝내지 못한 프레임을 `late_frames`로 세고, 다음 프레임 기준 시각을 현재로 당겨 뒤처진 만큼 몰아 보내는 버스트를 막는다. 측정 구간의 실제 fps는 `achieved_fps`로 기록한다.
 
 매트릭스 실행 전 `run_matrix.sh`가 `ping -M do -s <MTU-28> <상대 IP>`로 경로 MTU를 확인한다. 상대(NUC) MTU가 다르면 점보 프레임이 조용히 버려지는데도 결과에는 해당 MTU로 기록되기 때문이다.
 
@@ -157,7 +162,9 @@ G1 → G2 : zero-copy 순수 효과  ← 증명하고자 하는 값
 
 **지표 2 측정 방법.** bpftrace(`scripts/measure_copy.bt`)가 TCP 송신 복사 함수(`_copy_from_iter`, `_copy_from_iter_nocache`)의 체류 시간을 `comm == "zc-bench"`로 한정해 누적한다. bpftrace는 워밍업을 포함한 실행 전체를 관측하므로, 분모도 워밍업 포함 전체 전송 프레임 수(`frames_total`)와 zc-bench 총 실행 시간(`run_ns`)을 쓴다. bpftrace 자체의 `wall_ns`는 부착 대기와 timeout 여유분이 섞여 실제 실행보다 길므로 분모로 쓰지 않는다. 프로브 심볼은 아키텍처·커널 버전마다 다르므로 Phase 0(§8)에서 먼저 확인한다.
 
-**지표 1의 한계.** `%CPU`는 송신 프로세스의 CPU 시간(getrusage, user+sys)만 센다. `setup_env.sh`가 NIC IRQ를 core0에 고정하므로, 다른 코어의 softirq에서 처리되는 `MSG_ZEROCOPY` 완료 통보 비용 등은 지표 1에 잡히지 않을 수 있다(G2에 유리한 방향의 편향). 이를 교차 확인하도록 `run_matrix.sh`가 실행마다 `mpstat -P ALL 1`로 시스템 전체 CPU(%soft 포함)를 `data/raw/<tag>.mpstat`에 함께 기록한다.
+**지표 1의 한계.** `%CPU`는 송신 프로세스의 CPU 시간(getrusage, user+sys)만 센다. `setup_env.sh`가 NIC IRQ를 core0에 고정하므로, 다른 코어의 softirq에서 처리되는 `MSG_ZEROCOPY` 완료 통보 비용 등은 지표 1에 잡히지 않을 수 있다(G2에 유리한 방향의 편향). 이를 교차 확인하도록 `run_matrix.sh`가 실행마다 `mpstat -P ALL 1`로 시스템 전체 CPU(%soft 포함)를 `data/raw/<tag>.mpstat`에 함께 기록하고, `merge_copy.py`가 측정 구간 평균을 `sys_cpu_pct`(코어 1개 = 100% 단위)로 붙인다. 이를 goodput으로 나눈 `sys_cpu_per_gbps`를 **지표 1b**로 보고, 프로세스 기준(지표 1)과 G1→G2 절감률을 비교한다. 두 절감률이 크게 다르면 비용이 프로세스 밖(softirq 등)으로 옮겨간 것이다. 시스템 전체 값이라 다른 프로세스의 부하도 섞이므로 cpu 패스에서만 쓴다.
+
+**G2 구현 비용 최소화.** `MsgZcSink`는 완료 통보(errqueue)를 청크마다가 아니라 프레임당 1회 수거하고, 빈 버퍼를 기다릴 때는 `poll`로 잠든다(스핀 없음). 청크마다 `recvmsg`를 부르거나 스핀 대기하면 zero-copy와 무관한 시스템콜 비용이 G2의 지표 1에 더해져 효과를 과소평가하게 된다. 완료 통보가 flush 제한 시간 안에 다 오지 않은 실행은 `zc_completed < zc_sent`로 드러난다.
 
 **echo 지연과의 구분.** summary.csv의 `lat_*` 컬럼은 `--echo` 사용 시 측정되는 echo 왕복 지연의 1/2로, 지표 2(커널 복사 시간)와는 다른 값이다.
 
@@ -215,8 +222,13 @@ iperf3 -s                            # NUC
 iperf3 -c 192.168.50.2 -t 60 -P 1    # RPi5
 
 # 열/전원 (RPi5만 해당) — 0x0이 아니면 CPU 수치 전체가 무효
+# Ubuntu에는 vcgencmd가 없으므로 먼저 설치: sudo apt install libraspberrypi-bin
+# 일반 사용자로 실행돼야 zc-bench가 실행마다 스로틀을 판정할 수 있다 (sudo usermod -aG video $USER)
 vcgencmd get_throttled
 vcgencmd measure_temp
+
+# irqbalance — 켜져 있으면 setup_env.sh의 IRQ 고정을 덮어쓴다 (setup_env.sh가 중지)
+systemctl is-active irqbalance
 
 # GStreamer 및 필요 플러그인 확인 (RPi5)
 gst-launch-1.0 --version
@@ -246,7 +258,7 @@ gst-inspect-1.0 appsink appsrc v4l2src udpsink tcpserversink | grep -A2 "Factory
 | appsink 버퍼가 페이지 정렬 불충족 | G2에서 성공률 0%/폴백 | `CopySink`로 한 번 정렬 후 `MsgZcSink`에 전달하는 폴백 경로 사용 |
 | GStreamer dmabuf 연쇄 시 내부 복사 발생 | G4에서 CPU 차이 없음 | "L0 미동작"으로 결론, 실패 아닌 유효한 조사 결과로 기록 |
 | RPi5 서멀 스로틀링 | summary.csv `throttled` ≠ 0x0 (실행 중 발생분만 기록 — `get_throttled`의 부팅 후 누적 비트는 실행 전후 차이로만 반영) | 능동 쿨러 필수, 해당 실행은 `plot.py`가 자동 제외. `temp_c`로 온도 추이 확인 |
-| 442Mbps 구간에서 zero-copy 단독 효과 미미 | Case 간 CPU 차이 수 % 이내 | MTU 9000 및 fps 스윕(60/90)으로 부하를 높여 효과 크기 확인 |
+| 442Mbps 구간에서 zero-copy 단독 효과 미미 | Case 간 CPU 차이 수 % 이내 | MTU 9000 및 fps 60(885 Mbps)으로 부하를 높여 효과 크기 확인. 60fps는 포화 직전이므로 `achieved_fps` 확인 |
 
 ---
 

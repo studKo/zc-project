@@ -15,7 +15,7 @@ RPi5에서 카메라로 캡처한 raw 영상을 네트워크로 전송할 때, *
 | OS | Ubuntu 24.04 LTS (arm64) | Ubuntu 24.04 LTS (amd64) |
 | 연결 | 랜케이블 직결, 192.168.50.1 | 192.168.50.2 |
 
-카메라(CSI)는 아직 연결되지 않아, 그 전까지는 합성 프레임으로 대체합니다. 영상 조건은 1280×960 NV12 30fps(1.84MB/frame, 442Mbps)로 고정합니다.
+카메라(CSI)는 아직 연결되지 않아, 그 전까지는 합성 프레임으로 대체합니다. 영상 조건은 1280×960 NV12(1.84MB/frame)이며, 기본 30fps(442Mbps)입니다. fps 비교가 필요하면 24/30/60 중에서 고릅니다(24=354, 60=885 Mbps). 60fps는 GbE TCP 실효 대역폭(MTU 1500에서 약 941 Mbps)에 근접하고, 90fps(1,327 Mbps)는 링크 용량을 넘어 쓰지 않습니다.
 
 ---
 
@@ -120,6 +120,11 @@ sudo apt install -y linux-tools-raspi
 # sysstat 데몬 활성화
 sudo sed -i 's/ENABLED="false"/ENABLED="true"/' /etc/default/sysstat
 sudo systemctl enable --now sysstat
+
+# (RPi5만) vcgencmd — 스로틀·온도 판정에 필요. Ubuntu에는 기본 포함되지 않음
+sudo apt install -y libraspberrypi-bin
+sudo usermod -aG video "$USER"   # 일반 사용자로 vcgencmd 실행 (다시 로그인해야 적용)
+vcgencmd get_throttled           # 일반 사용자로 throttled=0x... 가 나와야 함
 ```
 
 ### 6.2 GStreamer (RPi5만 필요)
@@ -148,6 +153,8 @@ cargo build --release
 mkdir -p data
 chmod +x scripts/*.sh
 ```
+
+첫 빌드 후 생성되는 `zc-bench/Cargo.lock`은 저장소에 커밋합니다. 의존성 버전을 고정해야 다른 시점·장비에서도 같은 바이너리로 재현할 수 있습니다.
 
 `Cargo.toml`의 주요 의존성:
 
@@ -225,10 +232,19 @@ sudo ./scripts/setup_env.sh eth0 1500
 # 패스 2 — 지표 2·3 (bpftrace 동시 실행)
 # 스크립트는 sudo 없이 실행합니다. 시작할 때 sudo 비밀번호를 한 번 묻고 bpftrace만 sudo로 띄웁니다.
 ./scripts/run_matrix.sh 192.168.50.2:5001 3 60 copy
-python3 analysis/merge_copy.py data/summary.csv data/raw   # → summary_full.csv
+
+# 병합 — 복사 시간(copy 패스)과 시스템 전체 CPU(mpstat, 모든 패스)를 붙인다 → summary_full.csv
+# cpu 패스만 돌렸어도 실행합니다 (지표 1b 계산에 필요).
+python3 analysis/merge_copy.py data/summary.csv data/raw
 
 # MTU 9000 조건으로 전환 후 위 과정 반복 (양쪽 모두 설정)
 sudo ./scripts/setup_env.sh eth0 9000
+```
+
+fps는 기본 30 한 조건만 실행합니다. fps 비교가 필요하면 환경변수 `FPS`로 24/30/60 중에서 지정합니다. 그 밖의 값은 링크 용량을 넘는 조건이 섞이지 않도록 에러로 중단합니다.
+
+```bash
+FPS="24 30 60" ./scripts/run_matrix.sh 192.168.50.2:5001 10 100 cpu
 ```
 
 `run_matrix.sh`는 시작할 때 다음을 확인하고, 하나라도 실패하면 중단합니다.
@@ -249,6 +265,12 @@ python3 analysis/plot.py data/summary_full.csv
 
 `plot.py`는 zero-copy 성공률이 100%가 아니거나 기록이 없는 행, 실행 중 스로틀링이 발생한 행(`throttled`가 `0x0`/`n/a`가 아닌 행)을 자동으로 제외합니다. `n/a`는 `vcgencmd get_throttled`를 읽지 못한 실행(미설치, 또는 일반 사용자에게 `/dev/vcio` 권한 없음)으로 판정이 불가능해 제외하지 않으며, `plot.py`가 그 건수를 경고로 출력합니다. 스로틀 판정을 받으려면 RPi5에서 `vcgencmd get_throttled`가 일반 사용자로 동작하는지(보통 `video` 그룹 필요) 먼저 확인하십시오. 그래프는 MTU × fps 격자로 나뉘고, 막대는 반복 평균, 오차 막대는 95% 신뢰구간(t분포)입니다. 지표 1·4는 cpu 패스만, 지표 2·3은 copy 패스만 사용합니다.
 
+추가 그래프와 경고:
+
+- `0_achieved_fps.png` — 실제 달성 fps. 목표의 98% 미만인 조건은 경고로 출력합니다(링크 포화·버퍼 대기로 그 fps 조건이 성립하지 않음).
+- `1b_sys_cpu_per_gbps.png`, `5b_zerocopy_gain_sys.png` — mpstat 기반 시스템 전체 CPU(softirq 포함) 기준 지표 1과 G1→G2 절감률. 프로세스 기준(`1`, `5`)과 크게 다르면 비용이 프로세스 밖(softirq 등)으로 옮겨갔다는 뜻입니다.
+- msg_zc 실행에서 완료 통보가 전송 수보다 적으면(`zc_completed < zc_sent`) 경고합니다.
+
 ### 7.5 summary.csv 주요 컬럼
 
 | 컬럼 | 의미 |
@@ -259,10 +281,15 @@ python3 analysis/plot.py data/summary_full.csv
 | `frames` / `frames_total` | 워밍업 제외 / 포함 프레임 수 |
 | `elapsed_s` | 측정 구간 (워밍업 종료 ~ 송신 루프 종료). `cpu_pct`도 이 구간 기준 |
 | `run_ns` | zc-bench 총 실행 시간 (프로세스 시작 ~ flush 종료) — `copy_time_pct`의 분모 |
+| `achieved_fps` | 측정 구간의 실제 전송 fps. 목표(`fps`)보다 낮으면 링크 포화·버퍼 대기 |
+| `late_frames` | 측정 구간에서 한 주기(1/fps) 안에 전송을 끝내지 못한 프레임 수. 늦어지면 다음 프레임 기준 시각을 현재로 당겨 몰아 보내기(버스트)를 막음 |
+| `zc_sent` / `zc_completed` | MSG_ZEROCOPY 전송 건수 / 완료 통보 수신 건수. 완료가 적으면 flush 제한 시간(2초) 안에 통보를 다 못 받은 것 |
 | `throttled` | **이번 실행 중** 발생한 스로틀링 (현재 상태 bit0~3 + 실행 중 새로 켜진 이력 비트). `0x0`이어야 유효 |
 | `temp_c` | 실행 종료 시점 SoC 온도 (°C) |
 
-헤더는 파일을 만들 때 한 번만 쓰이므로, zc-bench는 헤더가 현재 스키마와 다른 기존 파일에는 이어 쓰지 않고 에러로 중단합니다.
+병합 후(`summary_full.csv`)에는 `copy_*`(bpftrace)와 `sys_cpu_pct`, `sys_soft_pct`, `sys_cpu_per_gbps`(mpstat, 코어 1개 = 100% 단위로 `cpu_pct`와 같은 단위)가 추가됩니다.
+
+헤더는 파일을 만들 때 한 번만 쓰이므로, zc-bench는 헤더가 현재 스키마와 다른 기존 파일에는 이어 쓰지 않고 에러로 중단합니다. 2026-09-29 스키마 변경(`achieved_fps`, `late_frames`, `zc_sent` 추가, `dropped` 제거) 이전에 만든 `data/summary.csv`는 `mv data/summary.csv data/summary.csv.old`로 옮긴 뒤 다시 측정하십시오.
 
 ---
 
