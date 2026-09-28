@@ -24,7 +24,7 @@ pub fn sleep_until(deadline_ns: u64) {
     let d = deadline_ns - now;
     let ts = libc::timespec {
         tv_sec: (d / 1_000_000_000) as libc::time_t,
-        tv_nsec: (d % 1_000_000_000) as i64,
+        tv_nsec: (d % 1_000_000_000) as libc::c_long,
     };
     unsafe {
         let mut rem = std::mem::zeroed::<libc::timespec>();

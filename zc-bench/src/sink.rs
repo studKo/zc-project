@@ -12,6 +12,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 pub trait FrameSink {
     /// 프레임 하나를 전송한다. 버퍼는 풀에서 꺼내 채운 뒤 넘긴다.
+    ///
+    /// `Ok`를 반환하면 풀에 빈 버퍼가 1개 이상 있어야 한다 (송신 루프가 다음 프레임에 바로 쓴다).
     fn send_frame(&mut self, pool: &mut BufPool, idx: usize, len: usize) -> io::Result<()>;
 
     /// 남은 완료 통보를 모두 수거한다 (측정 종료 시).
@@ -92,6 +94,10 @@ impl FrameSink for CopySink {
 /// ENOBUFS 연속 재시도 상한 (재시도마다 최대 1ms 대기 → 약 1초).
 const ENOBUFS_MAX_RETRY: u32 = 1000;
 
+/// 빈 버퍼를 기다리는 최대 시간. 링크가 끊기거나 수신 측이 멈추면 완료 통보가
+/// 영영 오지 않으므로, 무한 대기 대신 에러로 끝낸다.
+const BUFFER_WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
+
 /// `MSG_ZEROCOPY` 전송.
 ///
 /// 커널이 유저 페이지를 직접 참조하므로, 완료 통보를 받기 전까지
@@ -102,6 +108,8 @@ pub struct MsgZcSink {
     stats: ZcStats,
     /// 1회 sendmsg 당 최대 바이트. 0이면 프레임 전체를 한 번에 보낸다.
     chunk: usize,
+    /// drain_errqueue 결과 버퍼 (재사용해 송신 경로의 할당을 없앤다)
+    ranges: Vec<(u32, u32)>,
 }
 
 impl MsgZcSink {
@@ -113,12 +121,14 @@ impl MsgZcSink {
             fd,
             stats: ZcStats::default(),
             chunk,
+            ranges: Vec::with_capacity(64),
         })
     }
 
     /// errqueue를 비우고 완료된 버퍼를 풀에 되돌린다.
     fn reap(&mut self, pool: &mut BufPool) {
-        for (lo, hi) in zcstat::drain_errqueue(self.fd, &mut self.stats) {
+        zcstat::drain_errqueue(self.fd, &mut self.stats, &mut self.ranges);
+        for &(lo, hi) in &self.ranges {
             pool.complete_range(lo, hi);
         }
     }
@@ -135,20 +145,23 @@ impl MsgZcSink {
         }
     }
 
-    /// 버퍼가 하나도 없으면 완료를 기다린다.
-    fn wait_for_buffer(&mut self, pool: &mut BufPool) {
-        let mut spins = 0u32;
+    /// 버퍼가 하나도 없으면 완료 통보를 기다린다.
+    ///
+    /// recvmsg를 반복 호출하는 스핀 대기는 zero-copy와 무관한 CPU를 G2 측정값에 더하므로,
+    /// poll로 통보가 올 때까지 잠든 뒤 수거한다.
+    fn wait_for_buffer(&mut self, pool: &mut BufPool) -> io::Result<()> {
+        let deadline = crate::util::now_ns() + BUFFER_WAIT_TIMEOUT_NS;
         while pool.free_count() == 0 {
+            if crate::util::now_ns() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "zero-copy 완료 통보가 5초간 오지 않아 빈 버퍼를 확보하지 못했습니다 (링크·수신 측 확인)",
+                ));
+            }
+            self.poll_errqueue(10);
             self.reap(pool);
-            if pool.free_count() > 0 {
-                break;
-            }
-            spins += 1;
-            if spins > 64 {
-                self.poll_errqueue(10);
-                spins = 0;
-            }
         }
+        Ok(())
     }
 }
 
@@ -193,19 +206,19 @@ impl FrameSink for MsgZcSink {
 
             // 성공한 sendmsg 1회 = zc 카운터 1 증가
             pool.register_send(idx);
+            self.stats.sent += 1;
             off += n as usize;
-
-            // 매 전송마다 가볍게 수거 (errqueue 적체 방지)
-            self.reap(pool);
+            // 청크마다 수거하지 않는다: recvmsg 시스템콜이 청크 수만큼 늘어 G2 CPU를 부풀린다.
+            // 커널은 연속된 완료 통보를 범위 하나로 합쳐 두므로 프레임당 1회 수거로 충분하다.
         }
 
         // 프레임의 모든 청크를 넘겼다 — 이제부터 완료 통보로 회수될 수 있다
         // (그 전에는 등록된 청크가 전부 완료돼도 회수하지 않는다: BufPool 문서 참고)
         pool.finish_send(idx);
 
-        // 다음 프레임을 위한 버퍼 확보
-        self.wait_for_buffer(pool);
-        Ok(())
+        // 프레임당 1회 수거 후, 다음 프레임을 위한 버퍼 확보
+        self.reap(pool);
+        self.wait_for_buffer(pool)
     }
 
     fn flush(&mut self, pool: &mut BufPool) -> io::Result<()> {

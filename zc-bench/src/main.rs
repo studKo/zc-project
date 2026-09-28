@@ -13,14 +13,21 @@ mod zcstat;
 use frame::{nv12_size, FrameHeader, HeaderBuf, FOURCC_NV12, HEADER_SIZE};
 use sink::{CopySink, FrameSink, MsgZcSink, NullSink};
 use stats::{FrameRecord, Run, RunConfig};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::Arc;
+use std::time::Duration;
 use zcstat::BufPool;
 
 const ECHO_REC_SIZE: usize = 16; // seq(8) + rx_ns(8)
+
+/// 송신 측 연결 타임아웃 — 수신 측이 꺼져 있을 때 SYN 재전송(수십 초~2분) 동안 멈추지 않도록
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 수신 측이 헤더의 payload 값만 믿고 할당하지 않도록 두는 상한 (1280x960 NV12는 약 1.8 MB)
+const MAX_PAYLOAD: usize = 64 << 20;
 
 struct Args {
     mode: String,
@@ -116,7 +123,7 @@ fn parse_args() -> Args {
     let mut i = 0;
     while i < argv.len() {
         let k = argv[i].as_str();
-        let mut next = |i: &mut usize| -> String {
+        let next = |i: &mut usize| -> String {
             *i += 1;
             argv.get(*i).cloned().unwrap_or_else(|| usage())
         };
@@ -206,16 +213,8 @@ fn run_sender(args: &Args) -> std::io::Result<()> {
     // 싱크 준비
     let mut sink: Box<dyn FrameSink> = match args.sink.as_str() {
         "null" => Box::new(NullSink::new()),
-        "copy" => {
-            let s = TcpStream::connect(&args.target)?;
-            s.set_nodelay(true)?;
-            Box::new(CopySink::new(s, args.chunk))
-        }
-        "msg_zc" => {
-            let s = TcpStream::connect(&args.target)?;
-            s.set_nodelay(true)?;
-            Box::new(MsgZcSink::new(s, args.chunk)?)
-        }
+        "copy" => Box::new(CopySink::new(connect(&args.target)?, args.chunk)),
+        "msg_zc" => Box::new(MsgZcSink::new(connect(&args.target)?, args.chunk)?),
         other => {
             eprintln!("unknown sink: {}", other);
             usage()
@@ -227,9 +226,7 @@ fn run_sender(args: &Args) -> std::io::Result<()> {
     let (echo_tx, echo_rx) = mpsc::channel::<(u64, u64)>();
     let stop = Arc::new(AtomicBool::new(false));
     if echo_on {
-        let addr = echo_addr(&args.target);
-        let mut es = TcpStream::connect(&addr)?;
-        es.set_nodelay(true)?;
+        let mut es = connect(&echo_addr(&args.target)?)?;
         let stop2 = stop.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; ECHO_REC_SIZE];
@@ -272,15 +269,11 @@ fn run_sender(args: &Args) -> std::io::Result<()> {
         // 워밍업이 끝나는 시점에 CPU 기준점을 찍는다
         run.tick(util::now_ns());
 
-        let idx = match pool.acquire() {
-            Some(i) => i,
-            None => {
-                // 버퍼 고갈 = 완료 통보가 늦음 → 프레임 드롭
-                run.dropped += 1;
-                util::sleep_until(deadline);
-                continue;
-            }
-        };
+        // 싱크는 send_frame이 Ok면 빈 버퍼를 1개 이상 남긴다 (MsgZcSink는 완료 통보를 기다려 확보).
+        // 버퍼 대기로 늦어진 프레임은 아래 late로 기록된다.
+        let idx = pool.acquire().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, "버퍼 풀 고갈 — 싱크가 빈 버퍼를 확보하지 못했습니다")
+        })?;
 
         let tx_ns = util::now_ns();
         let h = FrameHeader::new(
@@ -295,12 +288,21 @@ fn run_sender(args: &Args) -> std::io::Result<()> {
 
         sink.send_frame(&mut pool, idx, frame_len)?;
 
+        // 한 주기 안에 끝나지 못했으면 late로 표시하고 기준 시각을 현재로 당긴다.
+        // 재동기화하지 않으면 뒤처진 만큼 이후 프레임을 쉬지 않고 몰아 보내는 버스트가 생긴다.
+        let now = util::now_ns();
+        let late = now > deadline;
+        if late {
+            deadline = now;
+        }
+
         run.push(FrameRecord {
             seq,
             tx_ns,
             echo_ns: 0,
             latency_ns: 0,
             bytes: frame_len as u64,
+            late,
         });
         seq += 1;
 
@@ -375,7 +377,7 @@ fn run_sender(args: &Args) -> std::io::Result<()> {
 }
 
 /// echo 도착 시각을 해당 프레임 기록에 반영한다 (지연 = RTT/2).
-/// 드롭된 프레임은 seq를 소비하지 않으므로 `records[seq]`가 곧 그 프레임이다.
+/// 송신 루프는 프레임마다 기록을 정확히 하나씩 추가하므로 `records[seq]`가 곧 그 프레임이다.
 fn apply_echo(run: &mut Run, seq: u64, when: u64) {
     if let Some(rec) = run.records.get_mut(seq as usize) {
         rec.echo_ns = when;
@@ -383,26 +385,49 @@ fn apply_echo(run: &mut Run, seq: u64, when: u64) {
     }
 }
 
-fn echo_addr(target: &str) -> String {
-    match target.rsplit_once(':') {
-        Some((host, p)) => {
-            let port: u16 = p.parse().unwrap_or(5001);
-            format!("{}:{}", host, port + 1)
+fn invalid_input(msg: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+/// `IP:PORT`에서 echo 채널 주소(`IP:PORT+1`)를 만든다.
+fn echo_addr(target: &str) -> io::Result<String> {
+    let (host, p) = target
+        .rsplit_once(':')
+        .ok_or_else(|| invalid_input(format!("--target은 IP:PORT 형식이어야 합니다: {}", target)))?;
+    let port: u16 = p
+        .parse()
+        .map_err(|_| invalid_input(format!("--target의 포트가 올바르지 않습니다: {}", target)))?;
+    let echo_port = port
+        .checked_add(1)
+        .ok_or_else(|| invalid_input("포트 65535는 echo 포트(+1)를 만들 수 없습니다".into()))?;
+    Ok(format!("{}:{}", host, echo_port))
+}
+
+/// 타임아웃을 두고 TCP 연결한다 (주소가 여러 개로 해석되면 차례로 시도).
+fn connect(target: &str) -> io::Result<TcpStream> {
+    let mut last_err = None;
+    for addr in target.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(s) => {
+                s.set_nodelay(true)?;
+                return Ok(s);
+            }
+            Err(e) => last_err = Some(e),
         }
-        None => format!("{}:5002", target),
     }
+    Err(last_err.unwrap_or_else(|| invalid_input(format!("주소를 해석할 수 없습니다: {}", target))))
 }
 
 // ──────────────────────────── RECEIVER ────────────────────────────
 
 fn run_receiver(args: &Args) -> std::io::Result<()> {
+    let echo_port = args
+        .port
+        .checked_add(1)
+        .ok_or_else(|| invalid_input("포트 65535는 echo 포트(+1)를 만들 수 없습니다".into()))?;
     let data_l = TcpListener::bind(("0.0.0.0", args.port))?;
-    let echo_l = TcpListener::bind(("0.0.0.0", args.port + 1))?;
-    println!(
-        "receiver: data :{}  echo :{}  (대기 중)",
-        args.port,
-        args.port + 1
-    );
+    let echo_l = TcpListener::bind(("0.0.0.0", echo_port))?;
+    println!("receiver: data :{}  echo :{}  (대기 중)", args.port, echo_port);
 
     loop {
         let (mut data, peer) = data_l.accept()?;
@@ -452,6 +477,10 @@ fn serve(data: &mut TcpStream, mut echo: Option<&mut TcpStream>) -> std::io::Res
                 break;
             }
         };
+        if payload > MAX_PAYLOAD {
+            eprintln!("frame desync — payload {} B가 상한 {} B를 넘습니다", payload, MAX_PAYLOAD);
+            break;
+        }
 
         if sink_buf.len() < payload {
             sink_buf.resize(payload, 0);

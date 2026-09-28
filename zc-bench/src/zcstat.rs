@@ -17,6 +17,11 @@
 //!
 //! 이 값을 집계하지 않으면 "zero-copy가 동작하지 않았음"을 "효과가 없음"으로
 //! 오독하게 된다. 따라서 모든 실험에서 `success_pct()`를 필수 기록한다.
+//!
+//! 정밀도 한계: 커널은 연이은 완료 통보를 id 범위 하나로 합치며, 이때 COPIED 비트는
+//! 범위 단위로 붙는다. errqueue를 프레임당 1회 수거하므로 범위가 프레임 하나 분량까지
+//! 길어질 수 있다. 전부 성공(100%)·전부 폴백(0%) 판정에는 영향이 없고, 일부만 폴백한
+//! PARTIAL 경우의 성공률만 범위 단위 근사치가 된다.
 
 use std::collections::{HashMap, VecDeque};
 use std::os::unix::io::RawFd;
@@ -32,7 +37,9 @@ pub const IPV6_RECVERR: libc::c_int = 25;
 /// zero-copy 통보 집계.
 #[derive(Debug, Default, Clone)]
 pub struct ZcStats {
-    /// 완료 통보로 확인된 전송 건수
+    /// MSG_ZEROCOPY로 보낸 전송 건수 (성공한 sendmsg 호출 수 = 발급된 zc id 수)
+    pub sent: u64,
+    /// 완료 통보로 확인된 전송 건수 (flush 제한 시간 안에 못 받으면 sent보다 작다)
     pub completed: u64,
     /// 그중 커널이 복사로 폴백한 건수
     pub copied: u64,
@@ -53,12 +60,13 @@ impl ZcStats {
 #[repr(C, align(8))]
 struct CmsgBuf([u8; 1024]);
 
-/// errqueue를 비우고 완료된 zc id 범위 `(lo, hi)` 목록을 반환한다.
+/// errqueue를 비우고 완료된 zc id 범위 `(lo, hi)`를 `ranges`에 채운다 (기존 내용은 지움).
 /// 완료·복사 폴백 건수는 `stats`에 누적한다.
 ///
+/// 송신 경로에서 자주 불리므로 결과 버퍼는 호출자가 재사용한다 (매번 할당하지 않도록).
 /// `fd`는 유효한 소켓이어야 한다.
-pub fn drain_errqueue(fd: RawFd, stats: &mut ZcStats) -> Vec<(u32, u32)> {
-    let mut ranges = Vec::new();
+pub fn drain_errqueue(fd: RawFd, stats: &mut ZcStats, ranges: &mut Vec<(u32, u32)>) {
+    ranges.clear();
     let mut ctrl = CmsgBuf([0u8; 1024]);
 
     loop {
@@ -98,7 +106,6 @@ pub fn drain_errqueue(fd: RawFd, stats: &mut ZcStats) -> Vec<(u32, u32)> {
             cmsg = unsafe { libc::CMSG_NXTHDR(&msg, cmsg) };
         }
     }
-    ranges
 }
 
 /// 고정 크기 버퍼 풀.

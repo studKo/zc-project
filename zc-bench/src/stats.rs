@@ -17,6 +17,8 @@ pub struct FrameRecord {
     pub echo_ns: u64,
     pub latency_ns: u64,
     pub bytes: u64,
+    /// 전송이 한 주기(1/fps) 안에 끝나지 않아 다음 프레임 예정 시각을 넘겼는지
+    pub late: bool,
 }
 
 /// 실행 조건. 위치 인자 대신 이름 있는 필드로 넘겨 인자 순서 실수를 막는다.
@@ -67,7 +69,6 @@ pub struct Run {
     pub mtu: u32,
     pub chunk_bytes: usize,
     pub records: Vec<FrameRecord>,
-    pub dropped: u64,
     start_ns: u64,
     warmup_ns: u64,
     proc_start_ns: u64,
@@ -95,7 +96,6 @@ impl Run {
             mtu: cfg.mtu,
             chunk_bytes: cfg.chunk_bytes,
             records: Vec::with_capacity(8192),
-            dropped: 0,
             start_ns: now_ns(),
             warmup_ns: cfg.warmup_s * 1_000_000_000,
             proc_start_ns: cfg.proc_start_ns,
@@ -167,6 +167,10 @@ impl Run {
             .unwrap_or_else(now_ns)
             .saturating_sub(self.proc_start_ns);
 
+        // 목표 fps를 실제로 냈는지 — 링크 포화·버퍼 대기 시 목표보다 낮아진다
+        let achieved_fps = n as f64 / elapsed_s;
+        let late_frames = eff.iter().filter(|r| r.late).count() as u64;
+
         Summary {
             case: self.case.clone(),
             tag: self.tag.clone(),
@@ -181,6 +185,8 @@ impl Run {
             frames_total: self.records.len() as u64,
             elapsed_s,
             run_ns,
+            achieved_fps,
+            late_frames,
             goodput_mbps,
             cpu_pct,
             cpu_per_gbps,
@@ -190,12 +196,12 @@ impl Run {
             lat_max_us: lat.last().copied().unwrap_or(0) as f64 / 1000.0,
             lat_mean_us: mean(&lat) / 1000.0,
             lat_stddev_us: stddev(&lat) / 1000.0,
+            zc_sent: zc.sent,
             zc_completed: zc.completed,
             zc_copied: zc.copied,
             zc_success_pct: zc.success_pct(),
             ctx_vol: end.ctx.0.saturating_sub(start.ctx.0),
             ctx_invol: end.ctx.1.saturating_sub(start.ctx.1),
-            dropped: self.dropped,
             throttled: throttled_during(self.throttled_start, throttled_raw()),
             temp_c: temp_c().unwrap_or(f64::NAN),
         }
@@ -204,12 +210,12 @@ impl Run {
     /// 프레임 단위 원시 CSV.
     pub fn write_raw_csv<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         let mut w = BufWriter::new(File::create(path)?);
-        writeln!(w, "seq,tx_ns,echo_ns,latency_ns,bytes")?;
+        writeln!(w, "seq,tx_ns,echo_ns,latency_ns,bytes,late")?;
         for r in &self.records {
             writeln!(
                 w,
-                "{},{},{},{},{}",
-                r.seq, r.tx_ns, r.echo_ns, r.latency_ns, r.bytes
+                "{},{},{},{},{},{}",
+                r.seq, r.tx_ns, r.echo_ns, r.latency_ns, r.bytes, r.late as u8
             )?;
         }
         Ok(())
@@ -235,6 +241,10 @@ pub struct Summary {
     pub elapsed_s: f64,
     /// zc-bench 총 실행 시간 (프로세스 시작 ~ flush 종료, ns)
     pub run_ns: u64,
+    /// 측정 구간의 실제 전송 fps (목표 fps보다 낮으면 링크 포화·버퍼 대기)
+    pub achieved_fps: f64,
+    /// 측정 구간에서 한 주기 안에 전송을 끝내지 못한 프레임 수
+    pub late_frames: u64,
     pub goodput_mbps: f64,
     pub cpu_pct: f64,
     pub cpu_per_gbps: f64,
@@ -244,37 +254,39 @@ pub struct Summary {
     pub lat_max_us: f64,
     pub lat_mean_us: f64,
     pub lat_stddev_us: f64,
+    /// MSG_ZEROCOPY 전송 건수 (zc_completed가 이보다 작으면 완료 통보 누락)
+    pub zc_sent: u64,
     pub zc_completed: u64,
     pub zc_copied: u64,
     pub zc_success_pct: f64,
     pub ctx_vol: u64,
     pub ctx_invol: u64,
-    pub dropped: u64,
     pub throttled: String,
     /// 실행 종료 시점 SoC 온도 (°C, 측정 불가 시 NaN)
     pub temp_c: f64,
 }
 
 pub const SUMMARY_HEADER: &str = "case,tag,pass,sink,width,height,fps,mtu,chunk_bytes,\
-frames,frames_total,elapsed_s,run_ns,goodput_mbps,cpu_pct,cpu_per_gbps,\
+frames,frames_total,elapsed_s,run_ns,achieved_fps,late_frames,goodput_mbps,cpu_pct,cpu_per_gbps,\
 lat_p50_us,lat_p95_us,lat_p99_us,lat_max_us,lat_mean_us,lat_stddev_us,\
-zc_completed,zc_copied,zc_success_pct,ctx_vol,ctx_invol,dropped,throttled,temp_c";
+zc_sent,zc_completed,zc_copied,zc_success_pct,ctx_vol,ctx_invol,throttled,temp_c";
 
 impl Summary {
     pub fn csv_row(&self) -> String {
         format!(
             "{},{},{},{},{},{},{},{},{},\
-             {},{},{:.3},{},{:.2},{:.2},{:.2},\
+             {},{},{:.3},{},{:.2},{},{:.2},{:.2},{:.2},\
              {:.1},{:.1},{:.1},{:.1},{:.1},{:.1},\
-             {},{},{:.2},{},{},{},{},{:.1}",
+             {},{},{},{:.2},{},{},{},{:.1}",
             self.case, self.tag, self.pass, self.sink, self.width, self.height, self.fps,
             self.mtu, self.chunk_bytes,
-            self.frames, self.frames_total, self.elapsed_s, self.run_ns, self.goodput_mbps,
+            self.frames, self.frames_total, self.elapsed_s, self.run_ns,
+            self.achieved_fps, self.late_frames, self.goodput_mbps,
             self.cpu_pct, self.cpu_per_gbps,
             self.lat_p50_us, self.lat_p95_us, self.lat_p99_us, self.lat_max_us,
             self.lat_mean_us, self.lat_stddev_us,
-            self.zc_completed, self.zc_copied, self.zc_success_pct,
-            self.ctx_vol, self.ctx_invol, self.dropped, self.throttled, self.temp_c
+            self.zc_sent, self.zc_completed, self.zc_copied, self.zc_success_pct,
+            self.ctx_vol, self.ctx_invol, self.throttled, self.temp_c
         )
     }
 
@@ -325,6 +337,10 @@ impl Summary {
             self.case, self.sink, self.pass, self.mtu
         );
         println!("  frames            : {} ({:.1}s, 전체 {})", self.frames, self.elapsed_s, self.frames_total);
+        println!(
+            "  achieved fps      : {:.2} / 목표 {}   (late frames {})",
+            self.achieved_fps, self.fps, self.late_frames
+        );
         println!("  goodput           : {:.1} Mbps", self.goodput_mbps);
         println!("  CPU               : {:.2} %", self.cpu_pct);
         println!("  CPU per Gbps      : {:.2} %/Gbps   ← 1순위 지표", self.cpu_per_gbps);
@@ -336,8 +352,15 @@ impl Summary {
             println!("  echo RTT/2 max/stddev : {:.1} / {:.1} us", self.lat_max_us, self.lat_stddev_us);
         }
         println!("  ctx switches      : vol {} / invol {}", self.ctx_vol, self.ctx_invol);
-        println!("  dropped frames    : {}", self.dropped);
 
+        if self.zc_sent > 0 && self.zc_completed < self.zc_sent {
+            println!(
+                "  [경고] 완료 통보 누락 {}건 ({}/{} 수신) — 성공률은 수신된 통보 기준입니다",
+                self.zc_sent - self.zc_completed,
+                self.zc_completed,
+                self.zc_sent
+            );
+        }
         if self.zc_completed > 0 {
             let verdict = if self.zc_success_pct >= 99.99 {
                 "OK — 실제 zero-copy 성립"
@@ -393,6 +416,25 @@ mod tests {
         );
         // 인자 순서 실수(#1) 회귀 방지: 청크 크기가 그대로 기록되어야 한다
         assert_eq!(s.chunk_bytes, 65536);
+    }
+
+    #[test]
+    fn late_frames_counted_only_in_measurement_window() {
+        let mut run = Run::new(&cfg(now_ns()));
+        // 워밍업 구간 프레임 (측정 기준점 이전) — late여도 세지 않는다
+        run.push(FrameRecord { seq: 0, tx_ns: 0, echo_ns: 0, latency_ns: 0, bytes: 10, late: true });
+        run.tick(now_ns());
+        for seq in 1..=4 {
+            let tx_ns = now_ns();
+            run.push(FrameRecord { seq, tx_ns, echo_ns: 0, latency_ns: 0, bytes: 10, late: seq % 2 == 0 });
+        }
+        run.end_measure();
+        run.finish();
+        let s = run.summary(&ZcStats::default());
+        assert_eq!(s.frames, 4);
+        assert_eq!(s.frames_total, 5);
+        assert_eq!(s.late_frames, 2);
+        assert!(s.achieved_fps > 0.0);
     }
 
     #[test]
