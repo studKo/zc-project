@@ -128,7 +128,7 @@ G1 → G2 : zero-copy 순수 효과  ← 증명하고자 하는 값
 
 ### 5.2 2패스 측정
 
-지표 1과 지표 2는 분리해서 측정한다. bpftrace 프로브가 매 복사 호출마다 타임스탬프를 찍으므로, 같이 돌리면 그 오버헤드가 지표 1(%CPU per Gbps)에 섞여 들어간다.
+지표 1과 지표 2는 분리해서 측정한다. bpftrace가 997 Hz 샘플링과 `tcp_sendmsg_locked` 진입·반환 프로브를 동시에 돌리므로, 같이 돌리면 그 오버헤드가 지표 1(%CPU per Gbps)에 섞여 들어간다.
 
 | 패스 | 대상 지표 | 실행 |
 |---|---|---|
@@ -148,19 +148,21 @@ G1 → G2 : zero-copy 순수 효과  ← 증명하고자 하는 값
 | 순위 | 지표 | 근거 |
 |---|---|---|
 | 1 | %CPU per Gbps | 조건이 달라져도 비교 가능한 유일한 정규화 지표 |
-| 2 | 커널 복사 시간 | 커널이 프레임 복사에 실제로 소요한 시간. 주 지표는 **프레임당 복사 시간** `copy_us_frame = copy_ns_total / frames_total`, 보조 지표는 **점유율** `copy_time_pct = copy_ns_total / run_ns`. zero-copy 성립을 가장 직접적으로 증명하는 근거값 |
+| 2 | 커널 복사 시간 (샘플링 추정) | 커널이 프레임 복사에 소요한 시간. 주 지표는 **프레임당 복사 시간** `copy_us_frame = copy_ns_est / frames_total`, 보조 지표는 **점유율** `copy_time_pct = copy_ns_est / run_ns`와 **송신 함수 시간** `send_us_frame`(`tcp_sendmsg_locked` 체류, 복사 외 처리 포함). zero-copy 성립을 가장 직접적으로 증명하는 근거값 |
 
 **층 2 — 설명 지표 (왜 그런 결과가 나왔는가)**
 
 | 순위 | 지표 | 비고 |
 |---|---|---|
-| 3 | 복사 함수 호출 수 (`bpftrace`) | 2번(커널 복사 시간)과 동일 스크립트에서 동시 산출 |
+| 3 | 송신 함수 호출 수 (`tcp_sendmsg_locked`, `bpftrace`) | 복사 함수 호출 수는 잴 수 없어 대체한 지표. 2번(커널 복사 시간)과 동일 스크립트에서 동시 산출 |
 | 4 | syscall 수 / 컨텍스트 스위치 | |
 | 5 | zero-copy 실제 성공률 | **무효 판정 기준.** 100% 미만이면 해당 실행 폐기 |
 
 5번을 강조하는 이유: `MSG_ZEROCOPY`는 전제조건(scatter-gather 등)이 안 맞으면 **에러 없이 조용히 일반 복사로 되돌아간다.** 이를 확인하지 않으면 "효과가 없다"는 결론이 사실은 "zero-copy가 동작하지 않았다"는 오류일 수 있다. Case G0/G1은 커널 zero-copy를 쓰지 않으므로 5번 지표 대상에서 제외한다.
 
-**지표 2 측정 방법.** bpftrace(`scripts/measure_copy.bt`)가 TCP 송신 복사 함수(`_copy_from_iter`, `_copy_from_iter_nocache`)의 체류 시간을 `comm == "zc-bench"`로 한정해 누적한다. bpftrace는 워밍업을 포함한 실행 전체를 관측하므로, 분모도 워밍업 포함 전체 전송 프레임 수(`frames_total`)와 zc-bench 총 실행 시간(`run_ns`)을 쓴다. bpftrace 자체의 `wall_ns`는 부착 대기와 timeout 여유분이 섞여 실제 실행보다 길므로 분모로 쓰지 않는다. 프로브 심볼은 아키텍처·커널 버전마다 다르므로 Phase 0(§8)에서 먼저 확인한다.
+**지표 2 측정 방법 (샘플링).** 처음 계획은 TCP 송신의 복사 함수(`_copy_from_iter`, `_copy_from_iter_nocache`)에 kprobe를 걸어 체류 시간을 재는 것이었으나, RPi5 커널(6.8.0-1051-raspi, arm64)에서는 이 함수들과 `__arch_copy_from_user`, `skb_do_copy_data_nocache`에 kprobe가 붙지 않는다(`cannot attach kprobe, Invalid argument`). `csum_and_copy_from_iter_full`은 `tx-checksumming: on`이라 송신 경로가 아니고, `do_copy_data_nocache`는 붙지만 호출되지 않는다. 그래서 함수를 직접 프로브하는 대신 bpftrace `profile:hz:997`로 `comm == "zc-bench"`가 CPU 위에 있는 순간의 커널 함수를 세고, 그중 `__arch_copy_from_user`에 있던 표본의 비율로 복사 시간을 추정한다(`copy_cpu_pct` = 프로세스 CPU 시간 중 복사 비율). 루프백 시험에서 G1은 표본의 약 23.5%가 이 함수에 있었고 G2는 0이었다. 통계적 추정이므로 표본 수(`bpf_samples`)가 200개 미만인 행은 경고한다. bpftrace는 워밍업을 포함한 실행 전체를 관측하므로, 분모도 워밍업 포함 전체 전송 프레임 수(`frames_total`)와 zc-bench 총 실행 시간(`run_ns`)을 쓴다. bpftrace 자체의 `wall_ns`는 부착 대기와 timeout 여유분이 섞여 실제 실행보다 길므로 분모로 쓰지 않는다.
+
+**지표 3 (대체).** 복사 함수를 프로브할 수 없으므로 호출 수도 잴 수 없다. kprobe가 붙는 `tcp_sendmsg_locked`의 호출 수와 체류 시간을 대신 기록한다. 이 함수는 복사 외에 skb 할당 등 송신 처리 전체를 포함하므로 "복사 시간"이 아니라 "송신 함수 시간"이다.
 
 **지표 1의 한계.** `%CPU`는 송신 프로세스의 CPU 시간(getrusage, user+sys)만 센다. `setup_env.sh`가 NIC IRQ를 core0에 고정하므로, 다른 코어의 softirq에서 처리되는 `MSG_ZEROCOPY` 완료 통보 비용 등은 지표 1에 잡히지 않을 수 있다(G2에 유리한 방향의 편향). 이를 교차 확인하도록 `run_matrix.sh`가 실행마다 `mpstat -P ALL 1`로 시스템 전체 CPU(%soft 포함)를 `data/raw/<tag>.mpstat`에 함께 기록하고, `merge_copy.py`가 측정 구간 평균을 `sys_cpu_pct`(코어 1개 = 100% 단위)로 붙인다. 이를 goodput으로 나눈 `sys_cpu_per_gbps`를 **지표 1b**로 보고, 프로세스 기준(지표 1)과 G1→G2 절감률을 비교한다. 두 절감률이 크게 다르면 비용이 프로세스 밖(softirq 등)으로 옮겨간 것이다. 시스템 전체 값이라 다른 프로세스의 부하도 섞이므로 cpu 패스에서만 쓴다.
 
@@ -204,9 +206,9 @@ grep CONFIG_IO_URING /boot/config-$(uname -r)
 # zero-copy 전제조건 — off면 MSG_ZEROCOPY가 조용히 일반 복사로 폴백 (최우선 확인)
 ethtool -k eth0 | grep -E 'scatter-gather|segmentation'
 
-# 지표 2용 bpftrace 프로브 심볼 (RPi5) — 둘 다 보여야 한다
-sudo bpftrace -l 'kprobe:_copy_from_iter*'
-ethtool -k eth0 | grep tx-checksumming   # off 이면 measure_copy.bt에 csum_and_copy_from_iter_full 추가
+# 지표 2·3용 bpftrace 프로브 (RPi5) — 복사 함수는 kprobe 불가, 샘플링과 tcp_sendmsg_locked를 쓴다
+sudo bpftrace -l 'kprobe:tcp_sendmsg_locked'   # 한 줄이 나와야 함
+uname -r; ethtool -k eth0 | grep tx-checksumming
 
 # 드라이버, flow steering, 하드웨어 타임스탬프
 ethtool -i eth0 | grep driver

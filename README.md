@@ -56,16 +56,18 @@ GStreamer의 기본 네트워크 sink는 `MSG_ZEROCOPY`를 지원하지 않아, 
 | 순위 | 지표 |
 |---|---|
 | 1 | %CPU per Gbps |
-| 2 | 커널 복사 시간 (프레임당 `copy_us_frame`, 보조: 점유율 `copy_time_pct`) |
+| 2 | 커널 복사 시간 — 샘플링 추정 (프레임당 `copy_us_frame`, 보조: 점유율 `copy_time_pct`, 송신 함수 시간 `send_us_frame`) |
 
 **층 2 — 설명 지표**
 
 | 순위 | 지표 |
 |---|---|
-| 3 | 복사 함수 호출 수 |
+| 3 | 송신 함수 호출 수 (`send_calls`, 복사 함수 호출 수의 대체) |
 | 4 | syscall 수 / 컨텍스트 스위치 |
 | 5 | zero-copy 실제 성공률 (**무효 판정 기준**) |
 
+> 지표 2·3은 RPi5 커널(6.8.0-1051-raspi)에서 복사 함수(`_copy_from_iter`, `__arch_copy_from_user` 등)에 kprobe를 걸 수 없어, 함수를 직접 프로브하는 대신 997 Hz 샘플링으로 "`zc-bench`가 `__arch_copy_from_user` 안에 있던 표본 비율"을 추정합니다. 표본 수가 적으면 오차가 크며(`bpf_samples` 참고), 복사 함수 호출 수는 잴 수 없어 `tcp_sendmsg_locked` 호출 수로 대체했습니다.
+>
 > summary.csv의 `lat_*` 컬럼은 `--echo` 사용 시 측정되는 **echo 왕복 지연의 1/2**로, 지표 2(커널 복사 시간)와는 다른 값입니다. 매트릭스(`run_matrix.sh`)는 `--echo`를 쓰지 않으므로 이 컬럼은 0입니다.
 
 ---
@@ -92,7 +94,7 @@ zc-project/
     │   ├── run_matrix.sh           실험 매트릭스 자동 실행 (cpu / copy 2패스)
     │   └── measure_copy.bt         지표 2·3 측정용 bpftrace 스크립트
     ├── analysis/
-    │   ├── merge_copy.py           복사 시간 데이터를 summary.csv에 병합
+    │   ├── merge_copy.py           복사 점유율(bpftrace)·시스템 CPU(mpstat)를 summary.csv에 병합
     │   └── plot.py                 결과 그래프 생성
     └── data/                       측정 결과 (실행 시 생성)
 ```
@@ -216,10 +218,10 @@ zerocopy = { version = "0.8", features = ["derive"] }
 지표 1(%CPU per Gbps)과 지표 2(커널 복사 시간)는 **분리해서 측정**합니다.
 bpftrace 프로브 오버헤드가 CPU 수치를 부풀리기 때문입니다.
 
-copy 패스에 앞서 RPi5에서 프로브 심볼을 확인합니다 (`scripts/measure_copy.bt` 머리말 참고).
+copy 패스는 복사 함수에 kprobe를 걸지 않고 샘플링을 쓰므로 심볼 확인은 필요 없습니다. 다만 `tcp_sendmsg_locked`에 kprobe가 붙는지는 확인합니다 (근거는 `scripts/measure_copy.bt` 머리말 참고).
 
 ```bash
-sudo bpftrace -l 'kprobe:_copy_from_iter*'   # _copy_from_iter, _copy_from_iter_nocache 가 보여야 함
+sudo bpftrace -l 'kprobe:tcp_sendmsg_locked'   # 한 줄이 나와야 함
 ```
 
 ```bash
@@ -233,7 +235,7 @@ sudo ./scripts/setup_env.sh eth0 1500
 # 스크립트는 sudo 없이 실행합니다. 시작할 때 sudo 비밀번호를 한 번 묻고 bpftrace만 sudo로 띄웁니다.
 ./scripts/run_matrix.sh 192.168.50.2:5001 3 60 copy
 
-# 병합 — 복사 시간(copy 패스)과 시스템 전체 CPU(mpstat, 모든 패스)를 붙인다 → summary_full.csv
+# 병합 — 복사 점유율·송신 호출(copy 패스)과 시스템 전체 CPU(mpstat, 모든 패스)를 붙인다 → summary_full.csv
 # cpu 패스만 돌렸어도 실행합니다 (지표 1b 계산에 필요).
 python3 analysis/merge_copy.py data/summary.csv data/raw
 
@@ -287,7 +289,7 @@ python3 analysis/plot.py data/summary_full.csv
 | `throttled` | **이번 실행 중** 발생한 스로틀링 (현재 상태 bit0~3 + 실행 중 새로 켜진 이력 비트). `0x0`이어야 유효 |
 | `temp_c` | 실행 종료 시점 SoC 온도 (°C) |
 
-병합 후(`summary_full.csv`)에는 `copy_*`(bpftrace)와 `sys_cpu_pct`, `sys_soft_pct`, `sys_cpu_per_gbps`(mpstat, 코어 1개 = 100% 단위로 `cpu_pct`와 같은 단위)가 추가됩니다.
+병합 후(`summary_full.csv`)에는 `bpf_samples`, `copy_samples`, `copy_cpu_pct`, `copy_us_frame`, `copy_time_pct`, `send_calls`, `send_us_frame`(bpftrace 샘플링·송신 호출)과 `sys_cpu_pct`, `sys_soft_pct`, `sys_cpu_per_gbps`(mpstat, 코어 1개 = 100% 단위로 `cpu_pct`와 같은 단위)가 추가됩니다.
 
 헤더는 파일을 만들 때 한 번만 쓰이므로, zc-bench는 헤더가 현재 스키마와 다른 기존 파일에는 이어 쓰지 않고 에러로 중단합니다. 2026-09-29 스키마 변경(`achieved_fps`, `late_frames`, `zc_sent` 추가, `dropped` 제거) 이전에 만든 `data/summary.csv`는 `mv data/summary.csv data/summary.csv.old`로 옮긴 뒤 다시 측정하십시오.
 
