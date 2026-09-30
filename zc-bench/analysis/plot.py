@@ -117,7 +117,8 @@ if zc_missing.any():
 
 # 전송 단위 라벨 (0 = 프레임 전체)
 df["unit"] = df["chunk_bytes"].map(lambda b: "full" if b == 0 else f"{int(b) // 1024}K")
-df["unit_bytes"] = df["chunk_bytes"].where(df["chunk_bytes"] > 0, float("inf"))
+# 정수 열에 inf를 섞으면 pandas가 다시 정수로 내리려다 경고하므로 먼저 실수로 바꾼다
+df["unit_bytes"] = df["chunk_bytes"].astype(float).where(df["chunk_bytes"] > 0, float("inf"))
 UNIT_ORDER = (df.groupby("unit")["unit_bytes"].max().sort_values().index.tolist())
 df["ctx_total"] = df["ctx_vol"] + df["ctx_invol"]
 
@@ -149,7 +150,7 @@ def grid_bar(sub, col, ylabel, title, fname, lower_better=True):
     mtus = sorted(a["mtu"].unique())
     fpss = sorted(a["fps"].unique())
     fig, axes = plt.subplots(len(mtus), len(fpss),
-                             figsize=(4.8 * len(fpss), 3.8 * len(mtus)), squeeze=False)
+                             figsize=(max(4.8 * len(fpss), 7.5), 3.8 * len(mtus) + 0.4), squeeze=False)
     for i, mtu in enumerate(mtus):
         for j, fps in enumerate(fpss):
             ax = axes[i][j]
@@ -161,14 +162,17 @@ def grid_bar(sub, col, ylabel, title, fname, lower_better=True):
             mean = cell.pivot(index="unit", columns="case", values="mean").reindex(order)
             ci = cell.pivot(index="unit", columns="case", values="ci").reindex(order)
             # n<2 칸은 신뢰구간을 계산할 수 없어 오차 막대 없이 그린다
-            mean.plot(kind="bar", ax=ax, yerr=ci.fillna(0), capsize=3, rot=0)
-            ax.set_title(f"MTU {mtu} / {fps} fps")
+            has_ci = bool(ci.notna().any().any())
+            mean.plot(kind="bar", ax=ax, yerr=ci.fillna(0) if has_ci else None,
+                      capsize=3 if has_ci else 0, rot=0)
+            ax.set_title(f"MTU {mtu} / {fps} fps" + ("" if has_ci else "  (n=1, no CI)"))
             ax.set_xlabel("send unit")
             ax.set_ylabel(ylabel)
             ax.grid(alpha=0.3, axis="y")
             ax.legend(fontsize=8)
     better = "lower" if lower_better else "higher"
-    fig.suptitle(f"{title}  (bar = mean, error = 95% CI, {better} is better)")
+    # 두 줄로 나눠 그림 폭이 좁아도(예: fps 한 조건) 제목이 잘리지 않게 한다
+    fig.suptitle(f"{title}\n(bar = mean, error = 95% CI, {better} is better)", fontsize=10)
     fig.tight_layout()
     fig.savefig(os.path.join(OUTDIR, fname), dpi=140)
     plt.close(fig)
