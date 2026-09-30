@@ -3,16 +3,20 @@
 
 사용:
   python3 analysis/plot.py data/summary_full.csv [출력디렉터리]
-  (복사 시간 병합 전이면 data/summary.csv 도 가능 — 지표 2·3 그래프는 생략됨)
+  (bpftrace 결과 병합 전이면 data/summary.csv 도 가능 — 지표 2·3 그래프는 생략됨)
+
+지표 2·3은 복사 함수를 직접 프로브하지 못하는 커널이라 샘플링으로 추정한 값이다
+(scripts/measure_copy.bt 머리말). 표본 수가 적은 조건은 오차 막대가 크게 나온다.
 
 플랜 §6 지표 체계에 대응하는 그래프
 (모두 MTU × fps 격자, 막대 = 반복 평균, 오차 막대 = 95% 신뢰구간)
   0.  실제 달성 fps                  — 조건 성립 확인            [pass=cpu]
   1.  %CPU per Gbps                 — 층1 지표 1 (주 지표)     [pass=cpu]
   1b. 시스템 전체 %CPU per Gbps      — 지표 1 교차 확인(softirq 포함, mpstat 병합 후) [pass=cpu]
-  2.  프레임당 커널 복사 시간 (주)   — 층1 지표 2               [pass=copy]
-  2b. 커널 복사 시간 점유율 (보조)   — 층1 지표 2               [pass=copy]
-  3.  복사 함수 호출 수              — 층2 지표 3               [pass=copy]
+  2.  프레임당 커널 복사 시간 (주)   — 층1 지표 2, 샘플링 추정  [pass=copy]
+  2b. 커널 복사 시간 점유율 (보조)   — 층1 지표 2, 샘플링 추정  [pass=copy]
+  2c. 프레임당 송신 함수 시간 (보조) — tcp_sendmsg_locked 체류  [pass=copy]
+  3.  송신 함수 호출 수              — 층2 지표 3 (복사 함수 호출 수의 대체) [pass=copy]
   4.  컨텍스트 스위치                — 층2 지표 4               [pass=cpu]
   5.  G1 → G2 효과 분리 요약         — zero-copy 순수 효과      [pass=cpu] (5b: 시스템 CPU 기준)
 
@@ -199,17 +203,21 @@ elif not cpu.empty:
 has_copy = "copy_us_frame" in copy.columns and copy["copy_us_frame"].notna().any()
 if has_copy:
     grid_bar(copy, "copy_us_frame", "copy time per frame (us)",
-             "Metric 2: kernel copy time per frame", "2_copy_us_per_frame.png")
+             "Metric 2: kernel copy time per frame (sampled)", "2_copy_us_per_frame.png")
     grid_bar(copy, "copy_time_pct", "copy time share of run (%)",
-             "Metric 2b: kernel copy time share", "2b_copy_time_pct.png")
+             "Metric 2b: kernel copy time share (sampled)", "2b_copy_time_pct.png")
+    grid_bar(copy, "send_us_frame", "tcp_sendmsg_locked time per frame (us)",
+             "Metric 2c: send function time per frame (includes non-copy work)", "2c_send_us_per_frame.png")
 else:
     print("[참고] copy 패스의 copy_us_frame 값이 없어 지표 2·3 그래프를 건너뜁니다.")
     print("       ./scripts/run_matrix.sh <target> 3 60 copy")
     print("       python3 analysis/merge_copy.py data/summary.csv data/raw")
 
-# ── 3. 복사 함수 호출 수 (층2 지표 3) — copy 패스 ─────────────────
-if has_copy and "copy_calls" in copy.columns:
-    grid_bar(copy, "copy_calls", "copy fn calls", "Metric 3: copy function calls", "3_copy_calls.png")
+# ── 3. 송신 함수 호출 수 (층2 지표 3) — copy 패스 ─────────────────
+# 복사 함수 호출 수는 잴 수 없어(kprobe 불가) tcp_sendmsg_locked 호출 수로 대체한다.
+if has_copy and "send_calls" in copy.columns:
+    grid_bar(copy, "send_calls", "tcp_sendmsg_locked calls",
+             "Metric 3: send function calls (substitute for copy-function calls)", "3_send_calls.png")
 
 # ── 4. 컨텍스트 스위치 (층2 지표 4) — cpu 패스 ────────────────────
 if not cpu.empty:
