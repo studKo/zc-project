@@ -115,6 +115,9 @@ sudo apt install -y \
   sysstat linuxptp bpftrace jq \
   python3-pip python3-venv
 
+# 분석·그래프용 (결과를 그 자리에서 바로 분석하려면 필요, apt 버전으로 충분)
+sudo apt install -y python3-pandas python3-matplotlib python3-numpy
+
 # perf (라즈베리파이는 패키지명이 다를 수 있음)
 sudo apt install -y "linux-tools-$(uname -r)" 2>/dev/null || \
 sudo apt install -y linux-tools-raspi
@@ -260,8 +263,8 @@ FPS="24 30 60" ./scripts/run_matrix.sh 192.168.50.2:5001 10 100 cpu
 그래프 생성:
 
 ```bash
-python3 -m venv ~/venv-zc && source ~/venv-zc/bin/activate
-pip install pandas matplotlib numpy
+# §6.1에서 python3-pandas / python3-matplotlib / python3-numpy를 apt로 설치했다면 그대로 실행한다.
+# (RPi5 Ubuntu 24.04의 apt 버전 pandas 2.1.4, matplotlib 3.6.3에서 동작 확인)
 python3 analysis/plot.py data/summary_full.csv
 ```
 
