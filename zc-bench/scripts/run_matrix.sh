@@ -11,7 +11,7 @@
 #
 # 2패스 구조:
 #   pass=cpu   지표 1(%CPU per Gbps), 4(컨텍스트 스위치) — bpftrace 미사용 (프로브 오버헤드 배제)
-#   pass=copy  지표 2(프레임당 커널 복사 시간), 3(복사 호출 수) — bpftrace 동시 실행
+#   pass=copy  지표 2(샘플링으로 추정한 프레임당 커널 복사 시간), 3(tcp_sendmsg_locked 호출 수) — bpftrace 동시 실행
 #   tag와 summary.csv의 pass 컬럼으로 두 패스를 구분하므로 같은 파일에 있어도 섞이지 않는다.
 #
 # 실행 순서 (청크·fps 조합마다):
@@ -263,7 +263,7 @@ done
 echo
 echo "완료: $((TOTAL - FAILED))/$TOTAL 성공. 요약: $OUT"
 if [ "$PASS" = "copy" ]; then
-  echo "복사 시간 병합: python3 analysis/merge_copy.py $OUT $RAWDIR"
+  echo "복사 점유율·송신 호출 병합: python3 analysis/merge_copy.py $OUT $RAWDIR"
 fi
 echo "그래프: python3 analysis/plot.py data/summary_full.csv   (copy 패스 전이면 $OUT)"
 echo "  zero-copy 100% 미만·실행 중 스로틀 발생 행은 plot.py가 자동 제외합니다."

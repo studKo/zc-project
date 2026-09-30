@@ -1,27 +1,33 @@
 #!/usr/bin/env bpftrace
 /*
- * 지표 2(프레임당 커널 복사 시간) + 지표 3(복사 함수 호출 수) 동시 측정 — 송신(RPi5) 측.
+ * 지표 2(커널 복사 시간)와 지표 3(송신 호출 수) 측정 — 송신(RPi5) 측.
  *
- * TCP 송신 경로에서 유저 버퍼 → 커널(skb) 복사는 다음과 같이 들어간다 (Linux 6.8 기준).
- *   tcp_sendmsg_locked → skb_copy_to_page_nocache → skb_do_copy_data_nocache
- *     → copy_from_iter_full()          → _copy_from_iter          (기본)
- *     → copy_from_iter_full_nocache()  → _copy_from_iter_nocache  (NETIF_F_NOCACHE_COPY 켜진 NIC)
- *     → csum_and_copy_from_iter_full()                            (TX 체크섬 오프로드가 없을 때)
- * inline 래퍼는 프로브할 수 없으므로 실제 심볼 _copy_from_iter / _copy_from_iter_nocache 에 건다.
- * (이전 버전의 skb_copy_datagram_from_iter 는 UDP/unix 경로, copy_page_from_iter 는 pipe/read 경로라
- *  TCP 송신 복사를 잡지 못했고, __copy_from_user 는 arm64에서 inline이라 프로브할 수 없었다.)
+ * ── 왜 복사 함수에 kprobe를 걸지 않는가 ────────────────────────────────
+ * RPi5 커널(6.8.0-1051-raspi, arm64)에서 TCP 송신의 실제 복사 함수인
+ * _copy_from_iter / _copy_from_iter_nocache / __arch_copy_from_user 는
+ * /proc/kallsyms에는 있지만 kprobe를 걸 수 없다 (bpftrace: "cannot attach kprobe,
+ * Invalid argument"). skb_do_copy_data_nocache 도 마찬가지이고, do_copy_data_nocache 는
+ * 붙지만 송신 경로에서 호출되지 않는다(0회). tx-checksumming 이 on 이라
+ * csum_and_copy_from_iter_full 도 송신 복사 경로가 아니다.
+ * 그래서 함수를 직접 프로브하지 않고 다음 두 가지로 잰다.
  *
- * ★ 사전 확인 (RPi5에서 반드시 먼저 — 커널 심볼은 아키텍처·버전마다 다르다):
- *     sudo bpftrace -l 'kprobe:_copy_from_iter*'
- *       → _copy_from_iter, _copy_from_iter_nocache 둘 다 보여야 한다.
- *     ethtool -k eth0 | grep tx-checksumming
- *       → off 이면 csum_and_copy_from_iter_full 도 아래 두 프로브 목록에 추가해야 한다.
- *   확인 방법: copy 패스 1회 실행 시 G1(copy)의 copy_calls 가 G2(msg_zc)보다 훨씬 커야 한다.
+ * ── 지표 2: 샘플링으로 복사 점유율을 추정 ───────────────────────────────
+ *   profile:hz:997 로 zc-bench 가 CPU 위에 있는 순간의 커널 함수(ksym(pc))를 센다.
+ *   샘플 중 __arch_copy_from_user 에 있던 비율 = 프로세스 CPU 시간 중 유저→커널 복사 비율.
+ *   샘플링이므로 통계적 추정치이며, 표본 수(@samples_total)가 적으면 오차가 크다.
+ *   zero-copy(G2)가 성립하면 이 함수의 샘플이 0에 가까워야 하고, 대신
+ *   internal_get_user_pages_fast(페이지 고정) 같은 함수가 나타난다.
+ *   수신기가 같은 장비(루프백)이면 수신기(comm 도 zc-bench)의 __arch_copy_to_user 가 섞이지만
+ *   그건 복사 방향이 달라 집계에서 제외된다.
+ *
+ * ── 보조 지표 2 / 지표 3: tcp_sendmsg_locked 체류 시간과 호출 수 ─────────
+ *   이 함수는 kprobe 가 붙는다. 복사 외에 skb 할당·세그먼트 처리도 포함하므로
+ *   "복사 시간"이 아니라 "송신 함수 시간"이다. 호출 수는 "복사 함수 호출 수"의 대체 지표다
+ *   (sendmsg 1회 = 복사 1회 이상).
  *
  * 측정 범위
- *   - comm == "zc-bench" 인 스레드만 집계 (sshd 등 다른 프로세스의 복사 제외)
- *   - 중첩 호출은 가장 바깥 호출만 1건으로 센다 (@depth)
- *   - 워밍업을 포함한 zc-bench 실행 전체가 대상 → merge_copy.py는 frames_total / run_ns 로 나눈다
+ *   - comm == "zc-bench" 인 스레드만 집계 (sshd 등 다른 프로세스 제외)
+ *   - 워밍업을 포함한 zc-bench 실행 전체가 대상 → merge_copy.py 가 frames_total / run_ns 로 나눈다
  *
  * 사용
  *   run_matrix.sh 의 copy 패스가 자동 실행한다 (sudo timeout --signal=INT ... 로 스스로 종료).
@@ -29,57 +35,58 @@
  *
  * 주의
  *   프로브 오버헤드가 CPU 측정을 오염시키므로, 지표 1(%CPU per Gbps)을 재는 cpu 패스와는
- *   반드시 분리해서 돌린다.
+ *   반드시 분리해서 돌린다. 이 스크립트는 arm64 전용이다 (reg("pc") 와 커널 주소 범위 사용).
  */
 
 BEGIN
 {
     @t0 = nsecs;
-    // zero-copy가 성립해 복사가 0건이어도 END에서 0이 출력되도록 초기화
-    @copy_ns_total = sum(0);
-    @copy_calls = sum(0);
     printf("# zc-bench copy-time probe started\n");
 }
 
-/* 송신 경로: 유저 버퍼 -> 커널 */
-kprobe:_copy_from_iter,
-kprobe:_copy_from_iter_nocache
+/* 지표 3 + 보조 지표 2: 송신 함수 호출 수·체류 시간 */
+kprobe:tcp_sendmsg_locked
 /comm == "zc-bench"/
 {
-    if (@depth[tid] == 0) {
-        @start[tid] = nsecs;
-    }
-    @depth[tid] += 1;
+    @tsl_start[tid] = nsecs;
 }
 
-kretprobe:_copy_from_iter,
-kretprobe:_copy_from_iter_nocache
-/comm == "zc-bench" && @depth[tid] > 0/
+kretprobe:tcp_sendmsg_locked
+/comm == "zc-bench" && @tsl_start[tid]/
 {
-    @depth[tid] -= 1;
-    if (@depth[tid] == 0) {
-        $dur = nsecs - @start[tid];
-        @copy_ns_total = sum($dur);
-        @copy_calls = sum(1);
-        @copy_ns_hist = hist($dur);
-        delete(@start[tid]);
-        delete(@depth[tid]);
+    @tsl_ns = sum(nsecs - @tsl_start[tid]);
+    @tsl_calls = count();
+    delete(@tsl_start[tid]);
+}
+
+/* 지표 2: 997 Hz 샘플링. 커널 모드 샘플은 함수별로 센다 (유저 모드는 총 표본에만 포함).
+ * 커널 주소는 상위 16비트가 0xffff 이다 (arm64). 부호 없는 시프트로 비교해 부호 경고를 피한다.
+ * @top 의 키는 함수 이름이 아니라 주소(ksym_t)라서 같은 이름이 여러 줄로 출력된다 →
+ * 이름별 합산은 merge_copy.py 가 한다. */
+profile:hz:997
+/comm == "zc-bench"/
+{
+    @samples_total = count();
+    if ((reg("pc") >> 48) == 0xffff) {
+        @top[ksym(reg("pc"))] = count();
     }
 }
 
 END
 {
     $wall = nsecs - @t0;
-    clear(@start);
-    clear(@depth);
+    clear(@tsl_start);
     printf("\n");
     // wall_ns: bpftrace 부착 시간 (참고용 — timeout 여유분이 포함되므로 분모로 쓰지 않는다)
     printf("wall_ns %llu\n", $wall);
-    print(@copy_ns_total);
-    print(@copy_calls);
-    print(@copy_ns_hist);
-    clear(@copy_ns_total);
-    clear(@copy_calls);
-    clear(@copy_ns_hist);
+    printf("hz 997\n");
+    print(@samples_total);
+    print(@tsl_ns);
+    print(@tsl_calls);
+    print(@top);
+    clear(@samples_total);
+    clear(@tsl_ns);
+    clear(@tsl_calls);
+    clear(@top);
     clear(@t0);
 }
